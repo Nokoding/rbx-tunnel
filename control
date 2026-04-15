@@ -1,10 +1,10 @@
 Package: com.proxy.tunnel
 Name: rbx-tunnel
-Version: 1.0
+Version: 1.1
 Architecture: iphoneos-arm
 Description: SOCKS5 tunnel wrapper for Roblox traffic via crossover.proxy.rlwy.net
 Maintainer: Your Name <you@example.com>
 Author: Your Name
 Section: tweaks
 Depends: mobilesubstrate
-Filter: { Bundles = ( "com.roblox.roblox" ); }
+Filter: { Bundles = ( "com.roblox.robloxmonile" ); }
