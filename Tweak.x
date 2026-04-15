@@ -379,8 +379,7 @@ static int hooked_connect(int sockfd, const struct sockaddr *addr, socklen_t add
     }
 
     struct sockaddr_in dest4 = *(const struct sockaddr_in *)addr;
-    struct host_map_entry *entry = find_host_map_entry(&dest4);
-    if (is_proxy_addr(&dest4) && !entry) {
+    if (is_proxy_addr(&dest4)) {
         return orig_connect(sockfd, addr, addrlen);
     }
 
@@ -391,11 +390,7 @@ static int hooked_connect(int sockfd, const struct sockaddr *addr, socklen_t add
 
     struct socks5_dest dest_info;
     memset(&dest_info, 0, sizeof(dest_info));
-    if (entry && entry->host[0]) {
-        build_socks5_dest(&dest4, entry->host, &dest_info);
-    } else {
-        build_socks5_dest(&dest4, NULL, &dest_info);
-    }
+    build_socks5_dest(&dest4, NULL, &dest_info);
 
     int result = connect_via_proxy(sockfd, &dest_info);
     // If proxy connection fails, try direct connection as fallback
