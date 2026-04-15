@@ -33,13 +33,6 @@ static int g_udp_associated = 0;
 static int g_tcp_control_fd = -1;
 static _Thread_local bool g_in_getaddrinfo = false;
 
-struct host_map_entry {
-    struct addrinfo *ai;
-    struct sockaddr_in addr;
-    char host[256];
-    struct host_map_entry *next;
-};
-
 struct socks5_dest {
     uint8_t atyp;
     uint16_t port;
@@ -48,8 +41,6 @@ struct socks5_dest {
         char domain[256];
     } addr;
 };
-
-static struct host_map_entry *g_host_map = NULL;
 
 static bool sockaddr_equal(const struct sockaddr_in *a, const struct sockaddr_in *b) {
     return a && b && a->sin_family == b->sin_family && a->sin_port == b->sin_port && a->sin_addr.s_addr == b->sin_addr.s_addr;
@@ -66,19 +57,6 @@ static bool is_proxy_addr(const struct sockaddr_in *sa) {
         return true;
     }
     return false;
-}
-
-static void add_host_map_entry(struct addrinfo *ai, const char *host) {
-    // DNS proxying disabled - not used
-}
-
-static struct host_map_entry *find_host_map_entry(const struct sockaddr_in *addr) {
-    // DNS proxying disabled - not used
-    return NULL;
-}
-
-static void remove_host_map_entries_for_ai(struct addrinfo *ai) {
-    // DNS proxying disabled - not used
 }
 
 static bool resolve_proxy_addr(void) {
