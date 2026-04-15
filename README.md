@@ -8,7 +8,7 @@ A high-performance iOS SOCKS5 network tunnel dylib for Roblox traffic redirectio
 - **UDP Support**: Wraps outgoing UDP packets with SOCKS5 headers via UDP ASSOCIATE
 - **DNS Proxying**: Forces all hostname resolution through the SOCKS5 proxy via `getaddrinfo()` interception
 - **Low-Level Hooking**: Uses fishhook for symbol rebinding without Substrate/MSHook dependency
-- **Enterprise Ready**: Target package: `com.roblox.roblox` (filter via tweak metadata)
+- **Enterprise Ready**: Target package: `com.roblox.robloxmobile` (filter via tweak metadata)
 
 ## Build
 
