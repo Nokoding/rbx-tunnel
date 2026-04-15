@@ -121,7 +121,10 @@ static bool resolve_proxy_addr(void) {
     g_in_getaddrinfo = true;
     int rv = orig_getaddrinfo(PROXY_HOST, "50156", &hints, &result);
     g_in_getaddrinfo = false;
-    if (rv != 0 || !result) return false;
+    if (rv != 0 || !result) {
+        // Proxy resolution failed - fall back to direct connections
+        return false;
+    }
     for (struct addrinfo *ai = result; ai; ai = ai->ai_next) {
         if (ai->ai_family == AF_INET && ai->ai_addr) {
             memcpy(&g_proxy_addr, ai->ai_addr, sizeof(g_proxy_addr));
@@ -411,6 +414,11 @@ static int hooked_connect(int sockfd, const struct sockaddr *addr, socklen_t add
         return orig_connect(sockfd, addr, addrlen);
     }
 
+    // If proxy is not reachable, fall back to direct connection
+    if (!resolve_proxy_addr()) {
+        return orig_connect(sockfd, addr, addrlen);
+    }
+
     struct socks5_dest dest_info;
     memset(&dest_info, 0, sizeof(dest_info));
     if (entry && entry->host[0]) {
@@ -419,29 +427,18 @@ static int hooked_connect(int sockfd, const struct sockaddr *addr, socklen_t add
         build_socks5_dest(&dest4, NULL, &dest_info);
     }
 
-    return connect_via_proxy(sockfd, &dest_info);
+    int result = connect_via_proxy(sockfd, &dest_info);
+    // If proxy connection fails, try direct connection as fallback
+    if (result != 0) {
+        return orig_connect(sockfd, addr, addrlen);
+    }
+    return result;
 }
 
 static int hooked_getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res) {
-    if (!node || is_numeric_host(node) || strcmp(node, PROXY_HOST) == 0) {
-        return orig_getaddrinfo(node, service, hints, res);
-    }
-
-    if (g_in_getaddrinfo) {
-        return orig_getaddrinfo(node, service, hints, res);
-    }
-
-    g_in_getaddrinfo = true;
-    int rv = orig_getaddrinfo(PROXY_HOST, service, hints, res);
-    g_in_getaddrinfo = false;
-    if (rv != 0 || !*res) return rv;
-
-    for (struct addrinfo *ai = *res; ai; ai = ai->ai_next) {
-        if (ai->ai_addr && ai->ai_family == AF_INET) {
-            add_host_map_entry(ai, node);
-        }
-    }
-    return rv;
+    // DNS proxying disabled to prevent startup crashes
+    // Let the app use normal DNS resolution
+    return orig_getaddrinfo(node, service, hints, res);
 }
 
 static void hooked_freeaddrinfo(struct addrinfo *res) {
