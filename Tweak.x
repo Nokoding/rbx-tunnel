@@ -266,13 +266,7 @@ static ssize_t hooked_sendto(int sockfd, const void *buf, size_t len, int flags,
         return orig_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
     }
 
-    struct host_map_entry *entry = find_host_map_entry(dest4);
-    if (entry && entry->host[0]) {
-        build_socks5_dest(dest4, entry->host, &dest_info);
-    } else {
-        build_socks5_dest(dest4, NULL, &dest_info);
-    }
-
+    build_socks5_dest(dest4, NULL, &dest_info);
     return build_and_send_socks5_udp(sockfd, &dest_info, buf, len, flags);
 }
 
@@ -386,7 +380,6 @@ static int hooked_getaddrinfo(const char *node, const char *service, const struc
 
 static void hooked_freeaddrinfo(struct addrinfo *res) {
     if (!res) return;
-    remove_host_map_entries_for_ai(res);
     orig_freeaddrinfo(res);
 }
 
