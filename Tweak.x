@@ -51,13 +51,6 @@ struct socks5_dest {
 
 static struct host_map_entry *g_host_map = NULL;
 
-static bool is_numeric_host(const char *host) {
-    if (!host) return false;
-    struct in6_addr buf6;
-    struct in_addr buf4;
-    return inet_pton(AF_INET, host, &buf4) == 1 || inet_pton(AF_INET6, host, &buf6) == 1;
-}
-
 static bool sockaddr_equal(const struct sockaddr_in *a, const struct sockaddr_in *b) {
     return a && b && a->sin_family == b->sin_family && a->sin_port == b->sin_port && a->sin_addr.s_addr == b->sin_addr.s_addr;
 }
@@ -76,39 +69,16 @@ static bool is_proxy_addr(const struct sockaddr_in *sa) {
 }
 
 static void add_host_map_entry(struct addrinfo *ai, const char *host) {
-    if (!ai || !host || !ai->ai_addr) return;
-    if (ai->ai_addr->sa_family != AF_INET) return;
-    struct host_map_entry *entry = calloc(1, sizeof(*entry));
-    if (!entry) return;
-    entry->ai = ai;
-    memcpy(&entry->addr, ai->ai_addr, sizeof(entry->addr));
-    strncpy(entry->host, host, sizeof(entry->host) - 1);
-    entry->next = g_host_map;
-    g_host_map = entry;
+    // DNS proxying disabled - not used
 }
 
 static struct host_map_entry *find_host_map_entry(const struct sockaddr_in *addr) {
-    if (!addr) return NULL;
-    for (struct host_map_entry *entry = g_host_map; entry; entry = entry->next) {
-        if (sockaddr_equal(&entry->addr, addr)) return entry;
-    }
+    // DNS proxying disabled - not used
     return NULL;
 }
 
 static void remove_host_map_entries_for_ai(struct addrinfo *ai) {
-    struct host_map_entry *prev = NULL;
-    struct host_map_entry *entry = g_host_map;
-    while (entry) {
-        struct host_map_entry *next = entry->next;
-        if (entry->ai == ai) {
-            if (prev) prev->next = next;
-            else g_host_map = next;
-            free(entry);
-        } else {
-            prev = entry;
-        }
-        entry = next;
-    }
+    // DNS proxying disabled - not used
 }
 
 static bool resolve_proxy_addr(void) {
