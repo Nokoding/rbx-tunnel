@@ -1,18 +1,13 @@
-THEOS_DEVICE_IP = 192.168.1.100
+THEOS_DEVICE_IP =
+THEOS_PACKAGE_DIR_NAME = debs
+TARGET = iphone:clang:latest:14.0
 ARCHS = arm64
-TARGET = iphone:clang:14.0:14.0
-
-INSTALL_TARGET_PROCESSES = Roblox
 
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = rbxtunnel
-
 rbxtunnel_FILES = Tweak.xm
-rbxtunnel_CFLAGS = -fobjc-arc -O2 -Wno-unused-function
-rbxtunnel_LDFLAGS = -Wl,-segalign,4000  # Critical for iOS 9+ compatibility [^3^]
+# Remove fishhook from files list
+rbxtunnel_CFLAGS = -fobjc-arc -O2
 
-include $(THEOS_MAKE_PATH)/tweak.mk
-
-after-install::
-	install.exec "killall -9 Roblox"
+include $(THEOS)/makefiles/tweak.mk
