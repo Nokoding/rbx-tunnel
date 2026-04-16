@@ -12,6 +12,7 @@
 #import <sys/types.h>
 #import <unistd.h>
 #import <fcntl.h>
+#import <dispatch/dispatch.h>
 
 #define PROXY_HOST "crossover.proxy.rlwy.net"
 #define PROXY_PORT 50156
@@ -351,6 +352,11 @@ static int connect_via_proxy(int sockfd, const struct socks5_dest *dest) {
 
 int hooked_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     if (!g_initialized || !addr || addr->sa_family != AF_INET) {
+        return orig_connect(sockfd, addr, addrlen);
+    }
+
+    // CRITICAL FIX: Skip proxy on main thread to prevent watchdog kill
+    if (pthread_main_np()) {
         return orig_connect(sockfd, addr, addrlen);
     }
 
