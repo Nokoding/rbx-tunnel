@@ -411,12 +411,12 @@ __attribute__((section("__DATA,__interpose"))) = {
 
 __attribute__((constructor))
 static void init() {
-    // Resolve original functions via dlsym
-    orig_connect = dlsym(RTLD_NEXT, "connect");
-    orig_sendto = dlsym(RTLD_NEXT, "sendto");
-    orig_recvfrom = dlsym(RTLD_NEXT, "recvfrom");
-    orig_getaddrinfo = dlsym(RTLD_NEXT, "getaddrinfo");
-    orig_freeaddrinfo = dlsym(RTLD_NEXT, "freeaddrinfo");
+    // Resolve original functions via dlsym - cast through void* to avoid strict aliasing errors
+    orig_connect = (int (*)(int, const struct sockaddr *, socklen_t))dlsym(RTLD_NEXT, "connect");
+    orig_sendto = (ssize_t (*)(int, const void *, size_t, int, const struct sockaddr *, socklen_t))dlsym(RTLD_NEXT, "sendto");
+    orig_recvfrom = (ssize_t (*)(int, void *, size_t, int, struct sockaddr *, socklen_t *))dlsym(RTLD_NEXT, "recvfrom");
+    orig_getaddrinfo = (int (*)(const char *, const char *, const struct addrinfo *, struct addrinfo **))dlsym(RTLD_NEXT, "getaddrinfo");
+    orig_freeaddrinfo = (void (*)(struct addrinfo *))dlsym(RTLD_NEXT, "freeaddrinfo");
     
     if (!orig_connect || !orig_getaddrinfo) {
         // Failed to resolve - hooks won't work but app won't crash
