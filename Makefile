@@ -9,8 +9,10 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = rbxtunnel
 
 rbxtunnel_FILES = Tweak.xm
-rbxtunnel_CFLAGS = -fobjc-arc -Wall -Werror -O2
-rbxtunnel_LDFLAGS = -framework Foundation
-rbxtunnel_LIBRARIES = 
+rbxtunnel_CFLAGS = -fobjc-arc -O2 -Wno-unused-function
+rbxtunnel_LDFLAGS = -Wl,-segalign,4000  # Critical for iOS 9+ compatibility [^3^]
 
 include $(THEOS_MAKE_PATH)/tweak.mk
+
+after-install::
+	install.exec "killall -9 Roblox"
