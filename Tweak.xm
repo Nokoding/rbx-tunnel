@@ -11,7 +11,8 @@
 #import <sys/socket.h>
 #import <sys/types.h>
 #import <unistd.h>
-#import "fishhook.h"
+#import <fcntl.h>
+#import <dispatch/dispatch.h>
 
 #define PROXY_HOST "crossover.proxy.rlwy.net"
 #define PROXY_PORT 50156
@@ -21,17 +22,19 @@
 #define SOCKS5_CMD_UDP_ASSOCIATE 0x03
 #define SOCKS5_ATYP_IPV4 0x01
 
-static int (*orig_connect)(int, const struct sockaddr *, socklen_t);
-static ssize_t (*orig_sendto)(int, const void *, size_t, int, const struct sockaddr *, socklen_t);
-static ssize_t (*orig_recvfrom)(int, void *, size_t, int, struct sockaddr *, socklen_t *);
-static int (*orig_getaddrinfo)(const char *, const char *, const struct addrinfo *, struct addrinfo **);
-static void (*orig_freeaddrinfo)(struct addrinfo *);
+// Function pointers resolved via dlsym
+static int (*orig_connect)(int, const struct sockaddr *, socklen_t) = NULL;
+static ssize_t (*orig_sendto)(int, const void *, size_t, int, const struct sockaddr *, socklen_t) = NULL;
+static ssize_t (*orig_recvfrom)(int, void *, size_t, int, struct sockaddr *, socklen_t *) = NULL;
+static int (*orig_getaddrinfo)(const char *, const char *, const struct addrinfo *, struct addrinfo **) = NULL;
+static void (*orig_freeaddrinfo)(struct addrinfo *) = NULL;
 
 static struct sockaddr_in g_proxy_addr;
 static struct sockaddr_in g_udp_relay_addr;
 static int g_udp_associated = 0;
 static int g_tcp_control_fd = -1;
 static _Thread_local bool g_in_getaddrinfo = false;
+static bool g_initialized = false;
 
 struct socks5_dest {
     uint8_t atyp;
@@ -70,7 +73,6 @@ static bool resolve_proxy_addr(void) {
     int rv = orig_getaddrinfo(PROXY_HOST, "50156", &hints, &result);
     g_in_getaddrinfo = false;
     if (rv != 0 || !result) {
-        // Proxy resolution failed - fall back to direct connections
         return false;
     }
     for (struct addrinfo *ai = result; ai; ai = ai->ai_next) {
@@ -253,7 +255,10 @@ static ssize_t build_and_send_socks5_udp(int sockfd, const struct socks5_dest *d
     return sent == -1 ? -1 : len;
 }
 
-static ssize_t hooked_sendto(int sockfd, const void *buf, size_t len, int flags, const struct sockaddr *dest_addr, socklen_t addrlen) {
+// MARK: - Hooked Functions (Interposed)
+
+ssize_t hooked_sendto(int sockfd, const void *buf, size_t len, int flags, const struct sockaddr *dest_addr, socklen_t addrlen) {
+    if (!g_initialized) return orig_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
     if (!dest_addr || dest_addr->sa_family != AF_INET) {
         return orig_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
     }
@@ -284,8 +289,8 @@ static ssize_t parse_socks5_udp_packet(const uint8_t *packet, size_t packet_len,
     return 0;
 }
 
-static ssize_t hooked_recvfrom(int sockfd, void *buf, size_t len, int flags, struct sockaddr *src_addr, socklen_t *addrlen) {
-    if (!buf) return orig_recvfrom(sockfd, buf, len, flags, src_addr, addrlen);
+ssize_t hooked_recvfrom(int sockfd, void *buf, size_t len, int flags, struct sockaddr *src_addr, socklen_t *addrlen) {
+    if (!g_initialized || !buf) return orig_recvfrom(sockfd, buf, len, flags, src_addr, addrlen);
 
     size_t temp_len = len + 64;
     uint8_t *temp = malloc(temp_len);
@@ -345,8 +350,13 @@ static int connect_via_proxy(int sockfd, const struct socks5_dest *dest) {
     return 0;
 }
 
-static int hooked_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
-    if (!addr || addr->sa_family != AF_INET) {
+int hooked_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    if (!g_initialized || !addr || addr->sa_family != AF_INET) {
+        return orig_connect(sockfd, addr, addrlen);
+    }
+
+    // CRITICAL FIX: Skip proxy on main thread to prevent watchdog kill
+    if (pthread_main_np()) {
         return orig_connect(sockfd, addr, addrlen);
     }
 
@@ -355,7 +365,6 @@ static int hooked_connect(int sockfd, const struct sockaddr *addr, socklen_t add
         return orig_connect(sockfd, addr, addrlen);
     }
 
-    // If proxy is not reachable, fall back to direct connection
     if (!resolve_proxy_addr()) {
         return orig_connect(sockfd, addr, addrlen);
     }
@@ -365,31 +374,58 @@ static int hooked_connect(int sockfd, const struct sockaddr *addr, socklen_t add
     build_socks5_dest(&dest4, NULL, &dest_info);
 
     int result = connect_via_proxy(sockfd, &dest_info);
-    // If proxy connection fails, try direct connection as fallback
     if (result != 0) {
         return orig_connect(sockfd, addr, addrlen);
     }
     return result;
 }
 
-static int hooked_getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res) {
+int hooked_getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res) {
+    if (!g_initialized) return orig_getaddrinfo(node, service, hints, res);
     // DNS proxying disabled to prevent startup crashes
-    // Let the app use normal DNS resolution
     return orig_getaddrinfo(node, service, hints, res);
 }
 
-static void hooked_freeaddrinfo(struct addrinfo *res) {
+void hooked_freeaddrinfo(struct addrinfo *res) {
     if (!res) return;
     orig_freeaddrinfo(res);
 }
 
-%ctor {
-    struct rebinding rebindings[] = {
-        {"connect", (void *)hooked_connect, (void **)&orig_connect},
-        {"sendto", (void *)hooked_sendto, (void **)&orig_sendto},
-        {"recvfrom", (void *)hooked_recvfrom, (void **)&orig_recvfrom},
-        {"getaddrinfo", (void *)hooked_getaddrinfo, (void **)&orig_getaddrinfo},
-        {"freeaddrinfo", (void *)hooked_freeaddrinfo, (void **)&orig_freeaddrinfo},
-    };
-    rebind_symbols(rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
+// MARK: - Symbol Interposing (No Fishhook)
+
+typedef struct {
+    const void *replacement;
+    const void *original;
+} interpose_t;
+
+__attribute__((used)) static const interpose_t interposers[] 
+__attribute__((section("__DATA,__interpose"))) = {
+    { (const void *)hooked_connect, (const void *)connect },
+    { (const void *)hooked_sendto, (const void *)sendto },
+    { (const void *)hooked_recvfrom, (const void *)recvfrom },
+    { (const void *)hooked_getaddrinfo, (const void *)getaddrinfo },
+    { (const void *)hooked_freeaddrinfo, (const void *)freeaddrinfo },
+};
+
+// MARK: - Initialization
+
+__attribute__((constructor))
+static void init() {
+    // Resolve original functions via dlsym - cast through void* to avoid strict aliasing errors
+    orig_connect = (int (*)(int, const struct sockaddr *, socklen_t))dlsym(RTLD_NEXT, "connect");
+    orig_sendto = (ssize_t (*)(int, const void *, size_t, int, const struct sockaddr *, socklen_t))dlsym(RTLD_NEXT, "sendto");
+    orig_recvfrom = (ssize_t (*)(int, void *, size_t, int, struct sockaddr *, socklen_t *))dlsym(RTLD_NEXT, "recvfrom");
+    orig_getaddrinfo = (int (*)(const char *, const char *, const struct addrinfo *, struct addrinfo **))dlsym(RTLD_NEXT, "getaddrinfo");
+    orig_freeaddrinfo = (void (*)(struct addrinfo *))dlsym(RTLD_NEXT, "freeaddrinfo");
+    
+    if (!orig_connect || !orig_getaddrinfo) {
+        // Failed to resolve - hooks won't work but app won't crash
+        return;
+    }
+    
+    // Delay activation to avoid early startup issues
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), 
+                   dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        g_initialized = true;
+    });
 }
