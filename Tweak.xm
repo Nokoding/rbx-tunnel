@@ -1,202 +1,391 @@
-// Tweak.xm
-#import <Foundation/Foundation.h>
-#import <sys/socket.h>
-#import <netinet/in.h>
 #import <arpa/inet.h>
-#import <netdb.h>
 #import <dlfcn.h>
-#import <dispatch/dispatch.h>
-#import <pthread.h>
 #import <errno.h>
+#import <netdb.h>
+#import <netinet/in.h>
+#import <pthread.h>
+#import <stdbool.h>
+#import <stdio.h>
+#import <stdlib.h>
+#import <string.h>
+#import <sys/socket.h>
+#import <sys/types.h>
+#import <unistd.h>
 #import <fcntl.h>
 
-#define LOG(fmt, ...) NSLog(@"[rbx-tunnel] " fmt, ##__VA_ARGS__)
 #define PROXY_HOST "crossover.proxy.rlwy.net"
 #define PROXY_PORT 50156
-#define CONNECT_TIMEOUT 5
+#define SOCKS5_VERSION 0x05
+#define SOCKS5_NO_AUTH 0x00
+#define SOCKS5_CMD_CONNECT 0x01
+#define SOCKS5_CMD_UDP_ASSOCIATE 0x03
+#define SOCKS5_ATYP_IPV4 0x01
 
-// MARK: - Function Pointers (resolved at runtime via dlsym)
-
+// Function pointers resolved via dlsym
 static int (*orig_connect)(int, const struct sockaddr *, socklen_t) = NULL;
 static ssize_t (*orig_sendto)(int, const void *, size_t, int, const struct sockaddr *, socklen_t) = NULL;
 static ssize_t (*orig_recvfrom)(int, void *, size_t, int, struct sockaddr *, socklen_t *) = NULL;
 static int (*orig_getaddrinfo)(const char *, const char *, const struct addrinfo *, struct addrinfo **) = NULL;
 static void (*orig_freeaddrinfo)(struct addrinfo *) = NULL;
 
-// MARK: - State
+static struct sockaddr_in g_proxy_addr;
+static struct sockaddr_in g_udp_relay_addr;
+static int g_udp_associated = 0;
+static int g_tcp_control_fd = -1;
+static _Thread_local bool g_in_getaddrinfo = false;
+static bool g_initialized = false;
 
-static BOOL g_initialized = NO;
-static __thread BOOL g_inGetaddrinfo = NO;
+struct socks5_dest {
+    uint8_t atyp;
+    uint16_t port;
+    union {
+        struct in_addr ipv4;
+        char domain[256];
+    } addr;
+};
 
-// MARK: - SOCKS5 Implementation (same as before, optimized)
-
-typedef enum {
-    SOCKS5_VERSION = 0x05,
-    SOCKS5_CMD_CONNECT = 0x01,
-    SOCKS5_ATYP_IPV4 = 0x01,
-    SOCKS5_ATYP_DOMAIN = 0x03,
-    SOCKS5_AUTH_NONE = 0x00
-} SOCKS5Constants;
-
-static BOOL socks5_handshake(int sockfd) {
-    uint8_t greeting[] = {SOCKS5_VERSION, 0x01, SOCKS5_AUTH_NONE};
-    if (send(sockfd, greeting, sizeof(greeting), 0) != sizeof(greeting)) return NO;
-    
-    uint8_t resp[2];
-    return (recv(sockfd, resp, 2, 0) == 2 && resp[0] == SOCKS5_VERSION && resp[1] == 0x00);
+static bool sockaddr_equal(const struct sockaddr_in *a, const struct sockaddr_in *b) {
+    return a && b && a->sin_family == b->sin_family && a->sin_port == b->sin_port && a->sin_addr.s_addr == b->sin_addr.s_addr;
 }
 
-static BOOL socks5_request(int sockfd, const struct sockaddr *addr) {
-    uint8_t req[256];
-    size_t len = 0;
-    
-    req[len++] = SOCKS5_VERSION;
-    req[len++] = SOCKS5_CMD_CONNECT;
-    req[len++] = 0x00;
-    
-    if (addr->sa_family == AF_INET) {
-        struct sockaddr_in *sin = (struct sockaddr_in *)addr;
-        req[len++] = SOCKS5_ATYP_IPV4;
-        memcpy(&req[len], &sin->sin_addr, 4); len += 4;
-        memcpy(&req[len], &sin->sin_port, 2); len += 2;
-    } else {
-        return NO; // IPv6 not implemented for brevity
+static bool is_proxy_addr(const struct sockaddr_in *sa) {
+    if (!sa || sa->sin_family != AF_INET) return false;
+    if (sa->sin_port == htons(PROXY_PORT)) {
+        if (g_proxy_addr.sin_addr.s_addr != 0 && sa->sin_addr.s_addr == g_proxy_addr.sin_addr.s_addr) {
+            return true;
+        }
     }
-    
-    if (send(sockfd, req, len, 0) != (ssize_t)len) return NO;
-    
-    uint8_t resp[256];
-    if (recv(sockfd, resp, 4, 0) != 4 || resp[1] != 0x00) return NO;
-    
-    // Drain remaining
-    size_t skip = (resp[3] == SOCKS5_ATYP_IPV4) ? 6 : (resp[3] == SOCKS5_ATYP_DOMAIN) ? resp[4] + 2 : 18;
-    recv(sockfd, resp, skip > 256 ? 256 : skip, 0);
-    
-    return YES;
+    if (g_udp_associated && sockaddr_equal(sa, &g_udp_relay_addr)) {
+        return true;
+    }
+    return false;
 }
 
-static int connect_proxy_async(void) {
-    // Resolve proxy host using original getaddrinfo (bypass hook)
-    g_inGetaddrinfo = YES;
-    struct addrinfo *res = NULL, hints = {0};
+static bool resolve_proxy_addr(void) {
+    if (g_proxy_addr.sin_addr.s_addr != 0) return true;
+
+    struct addrinfo hints = {0};
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
-    
-    if (orig_getaddrinfo(PROXY_HOST, NULL, &hints, &res) != 0 || !res) {
-        g_inGetaddrinfo = NO;
-        return -1;
+    struct addrinfo *result = NULL;
+    g_in_getaddrinfo = true;
+    int rv = orig_getaddrinfo(PROXY_HOST, "50156", &hints, &result);
+    g_in_getaddrinfo = false;
+    if (rv != 0 || !result) {
+        return false;
     }
-    g_inGetaddrinfo = NO;
-    
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) goto cleanup;
-    
-    // Non-blocking connect with timeout
-    int flags = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-    
-    struct sockaddr_in *proxy = (struct sockaddr_in *)res->ai_addr;
-    proxy->sin_port = htons(PROXY_PORT);
-    
-    int ret = orig_connect(sock, (struct sockaddr *)proxy, sizeof(*proxy));
-    if (ret < 0 && errno == EINPROGRESS) {
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(sock, &fds);
-        struct timeval tv = {CONNECT_TIMEOUT, 0};
-        
-        ret = select(sock + 1, NULL, &fds, NULL, &tv);
-        if (ret <= 0) {
-            close(sock);
-            sock = -1;
-            goto cleanup;
-        }
-        
-        int err = 0;
-        socklen_t len = sizeof(err);
-        getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len);
-        if (err != 0) {
-            close(sock);
-            sock = -1;
-            goto cleanup;
+    for (struct addrinfo *ai = result; ai; ai = ai->ai_next) {
+        if (ai->ai_family == AF_INET && ai->ai_addr) {
+            memcpy(&g_proxy_addr, ai->ai_addr, sizeof(g_proxy_addr));
+            g_proxy_addr.sin_port = htons(PROXY_PORT);
+            orig_freeaddrinfo(result);
+            return true;
         }
     }
-    
-    fcntl(sock, F_SETFL, flags);
-    
-    if (!socks5_handshake(sock) || !socks5_request(sock, (struct sockaddr *)proxy)) {
-        close(sock);
-        sock = -1;
+    orig_freeaddrinfo(result);
+    return false;
+}
+
+static void build_socks5_dest(const struct sockaddr_in *dest4, const char *domain, struct socks5_dest *out) {
+    if (!dest4 || !out) return;
+    out->port = dest4->sin_port;
+    if (domain && domain[0]) {
+        out->atyp = 0x03;
+        strncpy(out->addr.domain, domain, sizeof(out->addr.domain) - 1);
+    } else {
+        out->atyp = SOCKS5_ATYP_IPV4;
+        out->addr.ipv4 = dest4->sin_addr;
     }
-    
-cleanup:
-    orig_freeaddrinfo(res);
-    return sock;
+}
+
+static int socks5_send_all(int sockfd, const void *buf, size_t len) {
+    const uint8_t *ptr = buf;
+    while (len > 0) {
+        ssize_t sent = send(sockfd, ptr, len, 0);
+        if (sent <= 0) {
+            return -1;
+        }
+        ptr += sent;
+        len -= sent;
+    }
+    return 0;
+}
+
+static int socks5_recv_all(int sockfd, void *buf, size_t len) {
+    uint8_t *ptr = buf;
+    while (len > 0) {
+        ssize_t recvd = recv(sockfd, ptr, len, 0);
+        if (recvd <= 0) {
+            return -1;
+        }
+        ptr += recvd;
+        len -= recvd;
+    }
+    return 0;
+}
+
+static bool perform_socks5_handshake(int sockfd) {
+    uint8_t greeting[3] = {SOCKS5_VERSION, 0x01, SOCKS5_NO_AUTH};
+    if (socks5_send_all(sockfd, greeting, sizeof(greeting)) != 0) return false;
+
+    uint8_t resp[2] = {0};
+    if (socks5_recv_all(sockfd, resp, sizeof(resp)) != 0) return false;
+    return resp[0] == SOCKS5_VERSION && resp[1] == SOCKS5_NO_AUTH;
+}
+
+static bool perform_socks5_tcp_connect(int sockfd, const struct socks5_dest *dest) {
+    if (!dest) return false;
+    uint8_t buffer[4 + 1 + 256 + 2];
+    size_t offset = 0;
+    buffer[offset++] = SOCKS5_VERSION;
+    buffer[offset++] = SOCKS5_CMD_CONNECT;
+    buffer[offset++] = 0x00;
+    buffer[offset++] = dest->atyp;
+
+    if (dest->atyp == SOCKS5_ATYP_IPV4) {
+        memcpy(buffer + offset, &dest->addr.ipv4.s_addr, 4);
+        offset += 4;
+    } else {
+        size_t host_len = strnlen(dest->addr.domain, sizeof(dest->addr.domain));
+        if (host_len == 0 || host_len > 255) return false;
+        buffer[offset++] = (uint8_t)host_len;
+        memcpy(buffer + offset, dest->addr.domain, host_len);
+        offset += host_len;
+    }
+    memcpy(buffer + offset, &dest->port, 2);
+    offset += 2;
+
+    if (socks5_send_all(sockfd, buffer, offset) != 0) return false;
+
+    uint8_t header[4];
+    if (socks5_recv_all(sockfd, header, sizeof(header)) != 0) return false;
+    if (header[0] != SOCKS5_VERSION || header[1] != 0x00) return false;
+    uint8_t atyp = header[3];
+    size_t addr_len = 0;
+    switch (atyp) {
+        case SOCKS5_ATYP_IPV4: addr_len = 4; break;
+        default: return false;
+    }
+    uint8_t discard[256];
+    if (socks5_recv_all(sockfd, discard, addr_len + 2) != 0) return false;
+    return true;
+}
+
+static bool establish_udp_association(void) {
+    if (g_udp_associated) return true;
+    if (!resolve_proxy_addr()) return false;
+
+    if (g_tcp_control_fd < 0) {
+        g_tcp_control_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (g_tcp_control_fd < 0) return false;
+        if (orig_connect(g_tcp_control_fd, (const struct sockaddr *)&g_proxy_addr, sizeof(g_proxy_addr)) != 0) {
+            close(g_tcp_control_fd);
+            g_tcp_control_fd = -1;
+            return false;
+        }
+        if (!perform_socks5_handshake(g_tcp_control_fd)) {
+            close(g_tcp_control_fd);
+            g_tcp_control_fd = -1;
+            return false;
+        }
+    }
+
+    uint8_t request[10] = {SOCKS5_VERSION, SOCKS5_CMD_UDP_ASSOCIATE, 0x00, SOCKS5_ATYP_IPV4, 0, 0, 0, 0, 0, 0};
+    if (socks5_send_all(g_tcp_control_fd, request, sizeof(request)) != 0) return false;
+
+    uint8_t header[4];
+    if (socks5_recv_all(g_tcp_control_fd, header, sizeof(header)) != 0) return false;
+    if (header[0] != SOCKS5_VERSION || header[1] != 0x00) return false;
+    uint8_t atyp = header[3];
+    if (atyp != SOCKS5_ATYP_IPV4) return false;
+
+    uint8_t address[6];
+    if (socks5_recv_all(g_tcp_control_fd, address, sizeof(address)) != 0) return false;
+    g_udp_relay_addr.sin_family = AF_INET;
+    memcpy(&g_udp_relay_addr.sin_addr.s_addr, address, 4);
+    memcpy(&g_udp_relay_addr.sin_port, address + 4, 2);
+    g_udp_associated = 1;
+    return true;
+}
+
+static ssize_t build_socks5_udp_packet(const struct socks5_dest *dest, const void *buf, size_t len, uint8_t **out_packet, size_t *out_len) {
+    if (!dest || !buf || !out_packet || !out_len) return -1;
+    size_t header_len = 4;
+    if (dest->atyp == SOCKS5_ATYP_IPV4) {
+        header_len += 4 + 2;
+    } else {
+        size_t host_len = strnlen(dest->addr.domain, sizeof(dest->addr.domain));
+        if (host_len == 0 || host_len > 255) return -1;
+        header_len += 1 + host_len + 2;
+    }
+    *out_len = header_len + len;
+    *out_packet = malloc(*out_len);
+    if (!*out_packet) return -1;
+    (*out_packet)[0] = 0x00;
+    (*out_packet)[1] = 0x00;
+    (*out_packet)[2] = 0x00;
+    (*out_packet)[3] = dest->atyp;
+    size_t offset = 4;
+    if (dest->atyp == SOCKS5_ATYP_IPV4) {
+        memcpy(*out_packet + offset, &dest->addr.ipv4.s_addr, 4);
+        offset += 4;
+    } else {
+        uint8_t host_len = (uint8_t)strnlen(dest->addr.domain, sizeof(dest->addr.domain));
+        (*out_packet)[offset++] = host_len;
+        memcpy(*out_packet + offset, dest->addr.domain, host_len);
+        offset += host_len;
+    }
+    memcpy(*out_packet + offset, &dest->port, 2);
+    offset += 2;
+    memcpy(*out_packet + offset, buf, len);
+    return 0;
+}
+
+static ssize_t build_and_send_socks5_udp(int sockfd, const struct socks5_dest *dest, const void *buf, size_t len, int flags) {
+    if (!dest || !buf || len == 0) return -1;
+    if (!establish_udp_association()) return -1;
+
+    uint8_t *packet = NULL;
+    size_t packet_len = 0;
+    if (build_socks5_udp_packet(dest, buf, len, &packet, &packet_len) != 0) return -1;
+
+    ssize_t sent = orig_sendto(sockfd, packet, packet_len, flags, (const struct sockaddr *)&g_udp_relay_addr, sizeof(g_udp_relay_addr));
+    free(packet);
+    return sent == -1 ? -1 : len;
 }
 
 // MARK: - Hooked Functions (Interposed)
 
-int hooked_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
-    if (!g_initialized || !addr) return orig_connect(sockfd, addr, addrlen);
-    
-    // Skip local/private
-    if (addr->sa_family == AF_INET) {
-        struct sockaddr_in *sin = (struct sockaddr_in *)addr;
-        uint8_t *b = (uint8_t *)&sin->sin_addr;
-        if (b[0] == 127 || b[0] == 10 || (b[0] == 172 && b[1] >= 16 && b[1] <= 31) || (b[0] == 192 && b[1] == 168)) {
-            return orig_connect(sockfd, addr, addrlen);
-        }
+ssize_t hooked_sendto(int sockfd, const void *buf, size_t len, int flags, const struct sockaddr *dest_addr, socklen_t addrlen) {
+    if (!g_initialized) return orig_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
+    if (!dest_addr || dest_addr->sa_family != AF_INET) {
+        return orig_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
     }
-    
-    LOG("Connecting to port %d", ntohs(((struct sockaddr_in *)addr)->sin_port));
-    
-    // Main thread check - critical fix
-    if (pthread_main_np()) {
-        LOG("Main thread connect - using direct");
-        return orig_connect(sockfd, addr, addrlen);
+
+    const struct sockaddr_in *dest4 = (const struct sockaddr_in *)dest_addr;
+    struct socks5_dest dest_info;
+    memset(&dest_info, 0, sizeof(dest_info));
+
+    if (is_proxy_addr(dest4)) {
+        return orig_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
     }
-    
-    int proxy = connect_proxy_async();
-    if (proxy < 0) {
-        LOG("Proxy failed, using direct");
-        return orig_connect(sockfd, addr, addrlen);
+
+    build_socks5_dest(dest4, NULL, &dest_info);
+    return build_and_send_socks5_udp(sockfd, &dest_info, buf, len, flags);
+}
+
+static ssize_t parse_socks5_udp_packet(const uint8_t *packet, size_t packet_len, uint8_t **payload, size_t *payload_len, struct sockaddr_in *peer) {
+    if (packet_len < 10) return -1;
+    if (packet[0] != 0x00 || packet[1] != 0x00 || packet[2] != 0x00) return -1;
+    if (packet[3] != SOCKS5_ATYP_IPV4) return -1;
+    *payload_len = packet_len - 10;
+    *payload = (uint8_t *)packet + 10;
+    if (peer) {
+        peer->sin_family = AF_INET;
+        memcpy(&peer->sin_addr.s_addr, packet + 4, 4);
+        memcpy(&peer->sin_port, packet + 8, 2);
     }
-    
-    // Replace socket fd
-    dup2(proxy, sockfd);
-    close(proxy);
-    
-    LOG("Tunneled via SOCKS5");
     return 0;
 }
 
-ssize_t hooked_sendto(int sockfd, const void *buf, size_t len, int flags,
-                      const struct sockaddr *dest_addr, socklen_t addrlen) {
-    return orig_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
-}
+ssize_t hooked_recvfrom(int sockfd, void *buf, size_t len, int flags, struct sockaddr *src_addr, socklen_t *addrlen) {
+    if (!g_initialized || !buf) return orig_recvfrom(sockfd, buf, len, flags, src_addr, addrlen);
 
-ssize_t hooked_recvfrom(int sockfd, void *buf, size_t len, int flags,
-                        struct sockaddr *src_addr, socklen_t *addrlen) {
-    return orig_recvfrom(sockfd, buf, len, flags, src_addr, addrlen);
-}
-
-int hooked_getaddrinfo(const char *node, const char *service,
-                       const struct addrinfo *hints, struct addrinfo **res) {
-    if (g_inGetaddrinfo || !node) {
-        return orig_getaddrinfo(node, service, hints, res);
+    size_t temp_len = len + 64;
+    uint8_t *temp = malloc(temp_len);
+    if (!temp) return -1;
+    struct sockaddr_in from = {0};
+    socklen_t fromlen = sizeof(from);
+    ssize_t recvd = orig_recvfrom(sockfd, temp, temp_len, flags, (struct sockaddr *)&from, &fromlen);
+    if (recvd <= 0) {
+        free(temp);
+        return recvd;
     }
-    
-    // Log DNS for debugging
-    LOG("DNS: %s", node);
-    
+
+    if (from.sin_family == AF_INET && is_proxy_addr(&from)) {
+        uint8_t *payload = NULL;
+        size_t payload_len = 0;
+        struct sockaddr_in peer = {0};
+        if (parse_socks5_udp_packet(temp, recvd, &payload, &payload_len, &peer) == 0) {
+            ssize_t ret = payload_len > len ? len : payload_len;
+            memcpy(buf, payload, ret);
+            if (src_addr && addrlen && *addrlen >= sizeof(peer)) {
+                memcpy(src_addr, &peer, sizeof(peer));
+                *addrlen = sizeof(peer);
+            }
+            free(temp);
+            return ret;
+        }
+    }
+
+    if (recvd > (ssize_t)len) recvd = len;
+    memcpy(buf, temp, recvd);
+    if (src_addr && addrlen && *addrlen >= sizeof(from)) {
+        memcpy(src_addr, &from, sizeof(from));
+        *addrlen = sizeof(from);
+    }
+    free(temp);
+    return recvd;
+}
+
+static int connect_via_proxy(int sockfd, const struct socks5_dest *dest) {
+    if (!resolve_proxy_addr()) return -1;
+    if (sockfd < 0 || !dest) return -1;
+
+    struct sockaddr_in proxy = g_proxy_addr;
+    if (orig_connect(sockfd, (const struct sockaddr *)&proxy, sizeof(proxy)) != 0) {
+        return -1;
+    }
+
+    if (!perform_socks5_handshake(sockfd)) {
+        errno = ECONNABORTED;
+        return -1;
+    }
+
+    if (!perform_socks5_tcp_connect(sockfd, dest)) {
+        errno = ECONNABORTED;
+        return -1;
+    }
+    return 0;
+}
+
+int hooked_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    if (!g_initialized || !addr || addr->sa_family != AF_INET) {
+        return orig_connect(sockfd, addr, addrlen);
+    }
+
+    struct sockaddr_in dest4 = *(const struct sockaddr_in *)addr;
+    if (is_proxy_addr(&dest4)) {
+        return orig_connect(sockfd, addr, addrlen);
+    }
+
+    if (!resolve_proxy_addr()) {
+        return orig_connect(sockfd, addr, addrlen);
+    }
+
+    struct socks5_dest dest_info;
+    memset(&dest_info, 0, sizeof(dest_info));
+    build_socks5_dest(&dest4, NULL, &dest_info);
+
+    int result = connect_via_proxy(sockfd, &dest_info);
+    if (result != 0) {
+        return orig_connect(sockfd, addr, addrlen);
+    }
+    return result;
+}
+
+int hooked_getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res) {
+    if (!g_initialized) return orig_getaddrinfo(node, service, hints, res);
+    // DNS proxying disabled to prevent startup crashes
     return orig_getaddrinfo(node, service, hints, res);
 }
 
 void hooked_freeaddrinfo(struct addrinfo *res) {
+    if (!res) return;
     orig_freeaddrinfo(res);
 }
 
-// MARK: - Interpose Section (No Fishhook Needed)
+// MARK: - Symbol Interposing (No Fishhook)
 
 typedef struct {
     const void *replacement;
@@ -216,16 +405,7 @@ __attribute__((section("__DATA,__interpose"))) = {
 
 __attribute__((constructor))
 static void init() {
-    LOG("Loading rbx-tunnel...");
-    
-    // Verify bundle
-    NSString *bundle = [[NSBundle mainBundle] bundleIdentifier];
-    if (![bundle isEqualToString:@"com.roblox.robloxmobile"]) {
-        LOG("Wrong bundle: %@, exiting", bundle);
-        return;
-    }
-    
-    // Resolve original functions via dlsym (RTLD_NEXT gets the "real" ones)
+    // Resolve original functions via dlsym
     orig_connect = dlsym(RTLD_NEXT, "connect");
     orig_sendto = dlsym(RTLD_NEXT, "sendto");
     orig_recvfrom = dlsym(RTLD_NEXT, "recvfrom");
@@ -233,14 +413,13 @@ static void init() {
     orig_freeaddrinfo = dlsym(RTLD_NEXT, "freeaddrinfo");
     
     if (!orig_connect || !orig_getaddrinfo) {
-        LOG("Failed to resolve originals");
+        // Failed to resolve - hooks won't work but app won't crash
         return;
     }
     
-    // Delay to avoid early initialization issues
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), 
+    // Delay activation to avoid early startup issues
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), 
                    dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        g_initialized = YES;
-        LOG("rbx-tunnel active");
+        g_initialized = true;
     });
 }
